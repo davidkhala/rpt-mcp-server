@@ -1,0 +1,22 @@
+{
+  "name": "rpt-mcp-server",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for Crystal Reports .rpt files (via a .NET Framework helper)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build:reader": "powershell -NoProfile -ExecutionPolicy Bypass -File reader/build.ps1",
+    "start": "node src/index.js"
+  },
+  "bin": {
+    "rpt-mcp-server": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "reader"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/server": "^2.3.1",
+    "zod": "^4.6.7"
+  }
+}

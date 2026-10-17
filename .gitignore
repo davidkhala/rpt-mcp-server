@@ -1,0 +1,6 @@
+node_modules/
+build/
+reader/RptReader.exe
+.env
+.env.*
+*.log

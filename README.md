@@ -17,62 +17,43 @@
 - 已安装 Crystal Reports for Visual Studio,即 GAC 中存在 `CrystalDecisions.*` 13.0.4000.0 程序集及 x64 运行时
 - .NET Framework 自带的 `csc.exe`(`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\`)
 
-## 构建
+## 使用(npx)
+
+npm 包已包含预编译的 `RptReader.exe`,无需自行构建。在 MCP client 中注册:
+
+```json
+{
+  "mcpServers": {
+    "crystal-reports": {
+      "command": "npx",
+      "args": ["-y", "@davidkhala/rpt-mcp-server"]
+    }
+  }
+}
+```
+
+Bob 的配置文件是 `~/.bob/settings/mcp.json`。
+
+server 不需要指定报表目录。调用工具时直接传 `.rpt` 的**绝对路径**(列出/搜索类工具传目录的绝对路径)即可。只会打开扩展名为 `.rpt` 的文件。
+
+## 从源码构建
 
 ```powershell
+git clone https://github.com/davidkhala/rpt-mcp-server.git
+cd rpt-mcp-server
 npm install
-npm run build:reader   # 编译 reader/RptReader.exe
+npm run build   # 编译 reader/RptReader.exe
 ```
 
-## 配置
-
-报表根目录不写死,按以下优先级确定:
-
-1. 命令行参数 `--root <目录>`(或 `--root=<目录>`)
-2. 环境变量 `RPT_ROOT`
-3. 都没给时,使用 server 进程的当前工作目录(MCP 客户端通常在当前 workspace 下启动它)
-
-所有工具只能访问根目录下的 `.rpt`,包括不能通过符号链接绕出去。
-
-在 `~/.bob/settings/mcp.json` 中注册(`<path-to>` 换成本项目所在位置)。
-
-默认读取当前 workspace:
-
-```json
-{
-  "mcpServers": {
-    "crystal-reports": {
-      "command": "node",
-      "args": ["<path-to>/rpt-mcp-server/src/index.js"]
-    }
-  }
-}
-```
-
-指定其他目录:
-
-```json
-{
-  "mcpServers": {
-    "crystal-reports": {
-      "command": "node",
-      "args": ["<path-to>/rpt-mcp-server/src/index.js", "--root", "<报表目录>"]
-    }
-  }
-}
-```
-
-| 配置项 | 必填 | 说明 |
-|---|---|---|
-| `--root` | 否 | 报表根目录,优先级最高 |
-| `RPT_ROOT` | 否 | 报表根目录,`--root` 未给时使用 |
-| `RPT_READER_EXE` | 否 | 自定义 `RptReader.exe` 路径,默认 `reader/RptReader.exe` |
+然后把 MCP client 配置里的 `command` 改为 `node`,`args` 改为 `["<path-to>/rpt-mcp-server/src/index.js"]`。
 
 ## 工具
 
+除 `list_reports` 和 `search_reports` 接收目录绝对路径 `dir` 外,其余工具都接收 `.rpt` 的绝对路径 `path`。
+
 | 工具 | 用途 |
 |---|---|
-| `list_reports` | 列出 `.rpt`,可按名字过滤 |
+| `list_reports` | 列出目录下的 `.rpt`,可按名字过滤 |
 | `get_report_summary` | 纸张、边距,以及各类对象的数量 |
 | `get_report_structure` | 各 section 及其对象类型统计 |
 | `list_report_objects` | 对象的位置、文本、绑定字段 |
@@ -84,7 +65,7 @@ npm run build:reader   # 编译 reader/RptReader.exe
 | `get_selection_formulas` | 记录和分组选择公式 |
 | `get_grouping_and_sorting` | 分组和排序 |
 | `get_subreports` | 子报表及其链接字段 |
-| `search_reports` | 在所有报表里搜 SQL、公式、字段、文本、参数、表 |
+| `search_reports` | 在目录下所有报表里搜 SQL、公式、字段、文本、参数、表 |
 | `export_report_json` | 单个报表的完整 JSON |
 
 ## 已知限制
@@ -98,8 +79,8 @@ npm run build:reader   # 编译 reader/RptReader.exe
 
 因此:
 
-- **换一台电脑**:目标机器必须安装同版本的 Crystal Reports,否则 `build:reader` 会编译失败。
-- **升级 Crystal**:版本号变化后,需要先修改 `reader/build.ps1` 里的 `$v`,再运行 `npm run build:reader` 重新编译。
+- **换一台电脑**:目标机器必须安装同版本的 Crystal Reports,否则 `build` 会编译失败。
+- **升级 Crystal**:版本号变化后,需要先修改 `reader/build.ps1` 里的 `$v`,再运行 `npm run build` 重新编译。
 - 读取器按 x64 编译,和已安装的 x64 运行时对应。
 
 ### 其他
@@ -111,7 +92,7 @@ npm run build:reader   # 编译 reader/RptReader.exe
 ## 测试
 
 ```powershell
-node scripts/smoke-test.mjs <报表目录>   # 也可以设置 RPT_ROOT 环境变量
+node scripts/smoke-test.mjs <报表目录>
 ```
 
-脚本通过 stdio 启动 server,调用全部工具,并验证路径越界会被拒绝。需要先编译 `reader/RptReader.exe`。
+脚本通过 stdio 启动 server,调用全部工具,并验证相对路径、非 `.rpt` 文件、不存在的路径会被拒绝。报表目录需包含 `avl_print.rpt` 和 `application_avl.rpt`。需要先编译 `reader/RptReader.exe`。

@@ -1,22 +1,48 @@
 {
-  "name": "rpt-mcp-server",
+  "name": "@davidkhala/rpt-mcp-server",
   "version": "0.1.0",
-  "description": "Read-only MCP server for Crystal Reports .rpt files (via a .NET Framework helper)",
+  "description": "MCP server for Crystal Reports .rpt files (via a .NET Framework integration)",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "crystal-reports"
+  ],
+  "license": "MIT",
+  "author": "David Liu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/davidkhala/rpt-mcp-server.git"
+  },
+  "homepage": "https://github.com/davidkhala/rpt-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/davidkhala/rpt-mcp-server/issues"
+  },
   "type": "module",
-  "private": true,
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "build:reader": "powershell -NoProfile -ExecutionPolicy Bypass -File reader/build.ps1",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File reader/build.ps1",
+    "prepublishOnly": "npm run build",
     "start": "node src/index.js"
   },
   "bin": {
-    "rpt-mcp-server": "./src/index.js"
+    "rpt-mcp-server": "src/index.js"
   },
   "files": [
     "src",
-    "reader"
+    "reader/RptReader.cs",
+    "reader/RptReader.exe",
+    "reader/build.ps1"
   ],
   "dependencies": {
-    "@modelcontextprotocol/server": "^2.3.1",
-    "zod": "^4.6.7"
+    "@modelcontextprotocol/server": "latest",
+    "zod": "latest"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

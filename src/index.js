@@ -11,19 +11,7 @@ import { z } from "zod/v4";
 // Configuration
 // ---------------------------------------------------------------------------
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const READER_EXE = process.env.RPT_READER_EXE ?? path.resolve(HERE, "..", "reader", "RptReader.exe");
-// Report root, in order of precedence:
-//   1. command line:  --root <dir>  or  --root=<dir>
-//   2. environment:   RPT_ROOT
-//   3. the current working directory (MCP clients normally start the server in the workspace)
-function rootFromArgs(argv) {
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--root") return argv[i + 1];
-    if (argv[i].startsWith("--root=")) return argv[i].slice("--root=".length);
-  }
-  return undefined;
-}
-const ROOT = path.resolve(rootFromArgs(process.argv.slice(2)) || process.env.RPT_ROOT || process.cwd());
+const READER_EXE = path.resolve(HERE, "..", "reader", "RptReader.exe");
 const READER_TIMEOUT_MS = 60_000;
 const MAX_PARALLEL_READERS = 4;
 
@@ -36,38 +24,32 @@ const MAX_PARALLEL_READERS = 4;
 class UserError extends Error {}
 
 // ---------------------------------------------------------------------------
-// Path sandbox
+// Path resolution (callers pass absolute paths; only .rpt files are ever opened)
 // ---------------------------------------------------------------------------
-function isInside(root, candidate) {
-  const rel = path.relative(root, candidate);
-  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
-}
-
-/** Resolve a user supplied path to a real .rpt file strictly inside ROOT. */
+/** Resolve an absolute path to an existing .rpt file. */
 async function resolveReport(input) {
-  const full = path.resolve(ROOT, input);
-  if (!isInside(ROOT, full)) throw new UserError("Path is outside the allowed report directory");
-  if (path.extname(full).toLowerCase() !== ".rpt") throw new UserError("Only .rpt files are supported");
+  if (!path.isAbsolute(input)) throw new UserError("Report path must be absolute");
+  if (path.extname(input).toLowerCase() !== ".rpt") throw new UserError("Only .rpt files are supported");
   let real;
   try {
-    real = await fs.realpath(full);
+    real = await fs.realpath(input);
+    if (!(await fs.stat(real)).isFile()) throw new Error("not a file");
   } catch {
     throw new UserError(`Report not found: ${input}`);
   }
-  if (!isInside(await fs.realpath(ROOT), real)) throw new UserError("Path is outside the allowed report directory");
   return real;
 }
 
+/** Resolve an absolute path to an existing directory. */
 async function resolveDirectory(input) {
-  const full = path.resolve(ROOT, input ?? ".");
-  if (!isInside(ROOT, full)) throw new UserError("Path is outside the allowed report directory");
+  if (!path.isAbsolute(input)) throw new UserError("Directory path must be absolute");
   let real;
   try {
-    real = await fs.realpath(full);
+    real = await fs.realpath(input);
+    if (!(await fs.stat(real)).isDirectory()) throw new Error("not a directory");
   } catch {
     throw new UserError(`Directory not found: ${input}`);
   }
-  if (!isInside(await fs.realpath(ROOT), real)) throw new UserError("Path is outside the allowed report directory");
   return real;
 }
 
@@ -117,16 +99,15 @@ function runReader(file) {
 
 async function loadReport(input) {
   const file = await resolveReport(input);
-  const rel = path.relative(await fs.realpath(ROOT), file).replaceAll("\\", "/");
   const stat = await fs.stat(file);
   const hit = cache.get(file);
-  if (hit && hit.mtimeMs === stat.mtimeMs) return { rel, dump: hit.dump };
+  if (hit && hit.mtimeMs === stat.mtimeMs) return { file, dump: hit.dump };
 
   await acquire();
   try {
     const dump = await runReader(file);
     cache.set(file, { mtimeMs: stat.mtimeMs, dump });
-    return { rel, dump };
+    return { file, dump };
   } finally {
     release();
   }
@@ -180,29 +161,29 @@ function asObject(v) {
   return v && typeof v === "object" && !Array.isArray(v) ? v : { value: v };
 }
 
-const pathArg = z.string().describe("Report path relative to the report root, e.g. avl_print.rpt");
+const pathArg = z.string().describe("Absolute path of the .rpt file, e.g. C:\\reports\\avl_print.rpt");
 
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
-const server = new McpServer({ name: "rpt-mcp-server", version: "0.1.0" });
+const { version } = JSON.parse(await fs.readFile(path.resolve(HERE, "..", "package.json"), "utf8"));
+const server = new McpServer({ name: "rpt-mcp-server", version });
 
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 
 server.registerTool(
   "list_reports",
   {
-    description: "List .rpt files under the report root (does not open them).",
+    description: "List .rpt files under a directory (does not open them). Returns absolute paths.",
     inputSchema: z.object({
-      subdir: z.string().optional().describe("Sub-directory relative to the root"),
+      dir: z.string().describe("Absolute path of the directory to scan, e.g. C:\\reports"),
       pattern: z.string().optional().describe("Case-insensitive substring filter on the file name"),
       recursive: z.boolean().optional().describe("Recurse into sub-directories (default true)"),
     }),
     annotations: readOnly,
   },
-  wrap(async ({ subdir, pattern, recursive }) => {
-    const dir = await resolveDirectory(subdir);
-    const realRoot = await fs.realpath(ROOT);
+  wrap(async ({ dir: dirInput, pattern, recursive }) => {
+    const dir = await resolveDirectory(dirInput);
     const files = await listRptFiles(dir, recursive ?? true);
     const needle = pattern?.toLowerCase();
     const items = [];
@@ -210,13 +191,13 @@ server.registerTool(
       if (needle && !path.basename(f).toLowerCase().includes(needle)) continue;
       const st = await fs.stat(f);
       items.push({
-        path: path.relative(realRoot, f).replaceAll("\\", "/"),
+        path: f,
         sizeBytes: st.size,
         modified: st.mtime.toISOString(),
       });
     }
     items.sort((a, b) => a.path.localeCompare(b.path));
-    return { root: ROOT, count: items.length, reports: items };
+    return { dir, count: items.length, reports: items };
   }),
 );
 
@@ -229,10 +210,10 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     const count = (v) => (Array.isArray(v) ? v.length : 0);
     return {
-      path: rel,
+      path: file,
       sizeBytes: dump.sizeBytes,
       summary: dump.summary,
       counts: {
@@ -262,9 +243,9 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({
         sections: (Array.isArray(r.sections) ? r.sections : []).map((s) => {
           const kinds = {};
@@ -289,9 +270,9 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p, section, kind }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({
         objects: (Array.isArray(r.sections) ? r.sections : [])
           .filter((s) => !section || s.name === section)
@@ -312,9 +293,9 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({
         tables: (Array.isArray(r.tables) ? r.tables : []).map((t) => ({
           name: t.name,
@@ -339,10 +320,10 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p, table }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     const want = table?.toLowerCase();
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({
         tables: (Array.isArray(r.tables) ? r.tables : [])
           .filter((t) => !want || String(t.name).toLowerCase() === want)
@@ -361,8 +342,8 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
-    return { path: rel, ...perReport(dump, (r) => ({ commands: r.commands })) };
+    const { file, dump } = await loadReport(p);
+    return { path: file, ...perReport(dump, (r) => ({ commands: r.commands })) };
   }),
 );
 
@@ -374,8 +355,8 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
-    return { path: rel, ...perReport(dump, (r) => ({ parameters: r.parameters })) };
+    const { file, dump } = await loadReport(p);
+    return { path: file, ...perReport(dump, (r) => ({ parameters: r.parameters })) };
   }),
 );
 
@@ -390,12 +371,12 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p, name }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     const needle = name?.toLowerCase();
     const filter = (v) =>
       Array.isArray(v) && needle ? v.filter((f) => String(f.name).toLowerCase().includes(needle)) : v;
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({
         formulas: filter(r.formulas),
         sqlExpressions: filter(r.sqlExpressions),
@@ -414,9 +395,9 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     return {
-      path: rel,
+      path: file,
       ...perReport(dump, (r) => ({ recordSelection: r.recordSelection, groupSelection: r.groupSelection })),
     };
   }),
@@ -430,8 +411,8 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
-    return { path: rel, ...perReport(dump, (r) => ({ groups: r.groups, sortFields: r.sortFields })) };
+    const { file, dump } = await loadReport(p);
+    return { path: file, ...perReport(dump, (r) => ({ groups: r.groups, sortFields: r.sortFields })) };
   }),
 );
 
@@ -443,9 +424,9 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
+    const { file, dump } = await loadReport(p);
     return {
-      path: rel,
+      path: file,
       subreports: dump.subreports.map((s) => ({
         name: s.name,
         links: s.links,
@@ -505,18 +486,17 @@ server.registerTool(
   "search_reports",
   {
     description:
-      "Case-insensitive text search across all reports (formulas, command SQL, field names, static text, parameters, tables). Example: which reports use the field PolicyNo.",
+      "Case-insensitive text search across all reports under a directory (formulas, command SQL, field names, static text, parameters, tables). Example: which reports use the field PolicyNo.",
     inputSchema: z.object({
+      dir: z.string().describe("Absolute path of the directory to search (recursive), e.g. C:\\reports"),
       query: z.string().min(2).max(200).describe("Text to look for"),
       scope: z.enum(searchScopes).optional().describe("Where to search (default all)"),
-      subdir: z.string().optional().describe("Limit to this sub-directory"),
       maxResults: z.number().int().min(1).max(500).optional().describe("Maximum hits to return (default 100)"),
     }),
     annotations: readOnly,
   },
-  wrap(async ({ query, scope, subdir, maxResults }) => {
-    const dir = await resolveDirectory(subdir);
-    const realRoot = await fs.realpath(ROOT);
+  wrap(async ({ dir: dirInput, query, scope, maxResults }) => {
+    const dir = await resolveDirectory(dirInput);
     const files = await listRptFiles(dir, true);
     const needle = query.toLowerCase();
     const limit = maxResults ?? 100;
@@ -525,16 +505,15 @@ server.registerTool(
     let total = 0;
     await Promise.all(
       files.map(async (f) => {
-        const rel = path.relative(realRoot, f).replaceAll("\\", "/");
         try {
-          const { dump } = await loadReport(rel);
+          const { dump } = await loadReport(f);
           const hits = searchReport(dump, needle, scope ?? "all");
           if (hits.length > 0) {
             total += hits.length;
-            results.push({ path: rel, hits });
+            results.push({ path: f, hits });
           }
         } catch {
-          errors.push(rel);
+          errors.push(f);
         }
       }),
     );
@@ -564,20 +543,20 @@ server.registerTool(
     annotations: readOnly,
   },
   wrap(async ({ path: p }) => {
-    const { rel, dump } = await loadReport(p);
-    return { path: rel, ...dump };
+    const { file, dump } = await loadReport(p);
+    return { path: file, ...dump };
   }),
 );
 
 async function main() {
-  const rootStat = await fs.stat(ROOT).catch(() => undefined);
-  if (!rootStat?.isDirectory()) throw new Error(`Report root is not a directory: ${ROOT}`);
   await fs.access(READER_EXE).catch(() => {
-    throw new Error(`RptReader.exe not found at ${READER_EXE}. Run: npm run build:reader`);
+    throw new Error(
+      `RptReader.exe not found at ${READER_EXE}. Build it with: powershell -File "${path.join(HERE, "..", "reader", "build.ps1")}"`,
+    );
   });
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`rpt-mcp-server running on stdio, root=${ROOT}`);
+  console.error("rpt-mcp-server running on stdio");
 }
 
 main().catch((error) => {

@@ -12,12 +12,18 @@ import { z } from "zod/v4";
 // ---------------------------------------------------------------------------
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const READER_EXE = process.env.RPT_READER_EXE ?? path.resolve(HERE, "..", "reader", "RptReader.exe");
-const ROOT_INPUT = process.env.RPT_ROOT;
-if (!ROOT_INPUT) {
-  console.error("RPT_ROOT environment variable is required");
-  process.exit(1);
+// Report root, in order of precedence:
+//   1. command line:  --root <dir>  or  --root=<dir>
+//   2. environment:   RPT_ROOT
+//   3. the current working directory (MCP clients normally start the server in the workspace)
+function rootFromArgs(argv) {
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--root") return argv[i + 1];
+    if (argv[i].startsWith("--root=")) return argv[i].slice("--root=".length);
+  }
+  return undefined;
 }
-const ROOT = path.resolve(ROOT_INPUT);
+const ROOT = path.resolve(rootFromArgs(process.argv.slice(2)) || process.env.RPT_ROOT || process.cwd());
 const READER_TIMEOUT_MS = 60_000;
 const MAX_PARALLEL_READERS = 4;
 
@@ -564,6 +570,8 @@ server.registerTool(
 );
 
 async function main() {
+  const rootStat = await fs.stat(ROOT).catch(() => undefined);
+  if (!rootStat?.isDirectory()) throw new Error(`Report root is not a directory: ${ROOT}`);
   await fs.access(READER_EXE).catch(() => {
     throw new Error(`RptReader.exe not found at ${READER_EXE}. Run: npm run build:reader`);
   });

@@ -15,7 +15,7 @@
 
 - Windows,Node.js 20 及以上
 - 已安装 Crystal Reports for Visual Studio,即 GAC 中存在 `CrystalDecisions.*` 13.0.4000.0 程序集及 x64 运行时
-- .NET Framework 自带的 `csc.exe`(`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\`),不需要 `dotnet` SDK
+- .NET Framework 自带的 `csc.exe`(`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\`)
 
 ## 构建
 
@@ -26,25 +26,46 @@ npm run build:reader   # 编译 reader/RptReader.exe
 
 ## 配置
 
-通过环境变量配置,在 `~/.bob/settings/mcp.json` 中注册:
+报表根目录不写死,按以下优先级确定:
+
+1. 命令行参数 `--root <目录>`(或 `--root=<目录>`)
+2. 环境变量 `RPT_ROOT`
+3. 都没给时,使用 server 进程的当前工作目录(MCP 客户端通常在当前 workspace 下启动它)
+
+所有工具只能访问根目录下的 `.rpt`,包括不能通过符号链接绕出去。
+
+在 `~/.bob/settings/mcp.json` 中注册(`<path-to>` 换成本项目所在位置)。
+
+默认读取当前 workspace:
 
 ```json
 {
   "mcpServers": {
     "crystal-reports": {
       "command": "node",
-      "args": ["C:\\Users\\david\\.bob\\playground\\rpt-mcp-server\\src\\index.js"],
-      "env": {
-        "RPT_ROOT": "C:\\Users\\david\\Documents\\GitHub.ibm\\avls_crystal_report"
-      }
+      "args": ["<path-to>/rpt-mcp-server/src/index.js"]
     }
   }
 }
 ```
 
-| 变量 | 必填 | 说明 |
+指定其他目录:
+
+```json
+{
+  "mcpServers": {
+    "crystal-reports": {
+      "command": "node",
+      "args": ["<path-to>/rpt-mcp-server/src/index.js", "--root", "<报表目录>"]
+    }
+  }
+}
+```
+
+| 配置项 | 必填 | 说明 |
 |---|---|---|
-| `RPT_ROOT` | 是 | 报表根目录。所有工具只能访问该目录下的 `.rpt`,包括不能通过符号链接绕出去 |
+| `--root` | 否 | 报表根目录,优先级最高 |
+| `RPT_ROOT` | 否 | 报表根目录,`--root` 未给时使用 |
 | `RPT_READER_EXE` | 否 | 自定义 `RptReader.exe` 路径,默认 `reader/RptReader.exe` |
 
 ## 工具
@@ -90,7 +111,7 @@ npm run build:reader   # 编译 reader/RptReader.exe
 ## 测试
 
 ```powershell
-node scripts/smoke-test.mjs
+node scripts/smoke-test.mjs <报表目录>   # 也可以设置 RPT_ROOT 环境变量
 ```
 
-脚本通过 stdio 启动构建后的 server,调用全部工具,并验证路径越界会被拒绝。需要先完成构建。
+脚本通过 stdio 启动 server,调用全部工具,并验证路径越界会被拒绝。需要先编译 `reader/RptReader.exe`。

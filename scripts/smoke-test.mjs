@@ -1,9 +1,14 @@
-// Smoke test: drives the built server over stdio with raw JSON-RPC.
+// Smoke test: drives the server over stdio with raw JSON-RPC.
+// Usage: node scripts/smoke-test.mjs <report-dir>   (or set RPT_ROOT)
 import { spawn } from "node:child_process";
 import readline from "node:readline";
 
-const child = spawn("node", ["src/index.js"], {
-  env: { ...process.env, RPT_ROOT: "C:\\Users\\david\\Documents\\GitHub.ibm\\avls_crystal_report" },
+const root = process.argv[2] ?? process.env.RPT_ROOT;
+if (!root) {
+  console.error("Usage: node scripts/smoke-test.mjs <report-dir>  (or set RPT_ROOT)");
+  process.exit(1);
+}
+const child = spawn("node", ["src/index.js", "--root", root], {
   stdio: ["pipe", "pipe", "inherit"],
 });
 const pending = new Map();

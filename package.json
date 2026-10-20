@@ -27,7 +27,8 @@
   "scripts": {
     "build": "powershell -NoProfile -ExecutionPolicy Bypass -File reader/build.ps1",
     "prepublishOnly": "npm run build",
-    "start": "node src/index.js"
+    "start": "node src/index.js",
+    "test": "mocha --timeout 120000 test/smoke.mjs"
   },
   "bin": {
     "rpt-mcp-server": "src/index.js"
@@ -44,5 +45,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "devDependencies": {
+    "mocha": "^12.0.3"
   }
 }

@@ -17,9 +17,10 @@ const MAX_PARALLEL_READERS = 4;
 
 // ---------------------------------------------------------------------------
 // The JSON emitted by RptReader.exe ("dump") has this shape:
-//   { name, file?, sizeBytes?, summary?, sections, tables, links, commands,
-//     parameters, formulas, sqlExpressions, runningTotals, summaryFields,
-//     groups, sortFields, recordSelection, groupSelection, subreports: [dump] }
+//   { name, file?, sizeBytes?, sourcePath?, summary?, sections, tables, links,
+//     commands, parameters, formulas, sqlExpressions, runningTotals,
+//     summaryFields, groups, sortFields, recordSelection, groupSelection,
+//     subreports: [dump] }
 // ---------------------------------------------------------------------------
 class UserError extends Error {}
 
@@ -97,6 +98,25 @@ function runReader(file) {
   });
 }
 
+/** Invoke RptReader.exe --write <jsonPath> <outRptPath> and resolve on success. */
+function runWriter(jsonPath, outRptPath) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      READER_EXE,
+      ["--write", jsonPath, outRptPath],
+      { timeout: READER_TIMEOUT_MS, windowsHide: true, encoding: "utf8" },
+      (err, _stdout, stderr) => {
+        if (err) {
+          console.error(`RptReader --write failed: ${err.message}\n${stderr}`);
+          reject(new UserError(`Failed to build the report: ${stderr.trim() || err.message}`));
+          return;
+        }
+        resolve();
+      },
+    );
+  });
+}
+
 async function loadReport(input) {
   const file = await resolveReport(input);
   const stat = await fs.stat(file);
@@ -113,13 +133,13 @@ async function loadReport(input) {
   }
 }
 
-async function listRptFiles(dir, recursive) {
+async function listRptFiles(dir) {
   const out = [];
   const entries = await fs.readdir(dir, { withFileTypes: true });
   for (const e of entries) {
     if (e.name.startsWith(".")) continue;
     const p = path.join(dir, e.name);
-    if (e.isDirectory() && recursive) out.push(...(await listRptFiles(p, true)));
+    if (e.isDirectory()) out.push(...(await listRptFiles(p)));
     else if (e.isFile() && e.name.toLowerCase().endsWith(".rpt")) out.push(p);
   }
   return out;
@@ -170,36 +190,6 @@ const { version } = JSON.parse(await fs.readFile(path.resolve(HERE, "..", "packa
 const server = new McpServer({ name: "rpt-mcp-server", version });
 
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
-
-server.registerTool(
-  "list_reports",
-  {
-    description: "List .rpt files under a directory (does not open them). Returns absolute paths.",
-    inputSchema: z.object({
-      dir: z.string().describe("Absolute path of the directory to scan, e.g. C:\\reports"),
-      pattern: z.string().optional().describe("Case-insensitive substring filter on the file name"),
-      recursive: z.boolean().optional().describe("Recurse into sub-directories (default true)"),
-    }),
-    annotations: readOnly,
-  },
-  wrap(async ({ dir: dirInput, pattern, recursive }) => {
-    const dir = await resolveDirectory(dirInput);
-    const files = await listRptFiles(dir, recursive ?? true);
-    const needle = pattern?.toLowerCase();
-    const items = [];
-    for (const f of files) {
-      if (needle && !path.basename(f).toLowerCase().includes(needle)) continue;
-      const st = await fs.stat(f);
-      items.push({
-        path: f,
-        sizeBytes: st.size,
-        modified: st.mtime.toISOString(),
-      });
-    }
-    items.sort((a, b) => a.path.localeCompare(b.path));
-    return { dir, count: items.length, reports: items };
-  }),
-);
 
 server.registerTool(
   "get_report_summary",
@@ -497,7 +487,7 @@ server.registerTool(
   },
   wrap(async ({ dir: dirInput, query, scope, maxResults }) => {
     const dir = await resolveDirectory(dirInput);
-    const files = await listRptFiles(dir, true);
+    const files = await listRptFiles(dir);
     const needle = query.toLowerCase();
     const limit = maxResults ?? 100;
     const results = [];
@@ -545,6 +535,64 @@ server.registerTool(
   wrap(async ({ path: p }) => {
     const { file, dump } = await loadReport(p);
     return { path: file, ...dump };
+  }),
+);
+
+const outPathArg = z.string().describe("Absolute path for the output file, e.g. C:\\reports\\out\\avl_print.json");
+const outRptArg = z.string().describe("Absolute path for the rebuilt .rpt file, e.g. C:\\reports\\out\\avl_print.rpt");
+
+server.registerTool(
+  "save_report_json",
+  {
+    description:
+      "Export the complete JSON dump of one report to a file on disk. " +
+      "The saved JSON includes a 'sourcePath' field pointing to the original .rpt, " +
+      "which build_report_from_json uses as a template when rebuilding.",
+    inputSchema: z.object({ path: pathArg, out: outPathArg }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  wrap(async ({ path: p, out }) => {
+    if (!path.isAbsolute(out)) throw new UserError("Output path must be absolute");
+    const { file, dump } = await loadReport(p);
+    const json = JSON.stringify({ path: file, ...dump }, null, 2);
+    await fs.mkdir(path.dirname(out), { recursive: true });
+    await fs.writeFile(out, json, "utf8");
+    return `Saved ${json.length} bytes → ${out}`;
+  }),
+);
+
+server.registerTool(
+  "build_report_from_json",
+  {
+    description:
+      "Rebuild a .rpt file from a JSON manifest previously produced by save_report_json or export_report_json. " +
+      "The JSON must contain a 'sourcePath' key with the path of the original .rpt (used as a template). " +
+      "Writable fields applied: SummaryInfo, selection formulas, formula/SQL-expression field text, " +
+      "table connection (server + database), command SQL, parameter discrete defaults, sort directions. " +
+      "After writing, the rebuilt file is immediately re-read and its JSON is returned so callers can " +
+      "compare it against the input JSON for roundtrip validation.",
+    inputSchema: z.object({ json: outPathArg.describe("Absolute path of the JSON manifest file"), out: outRptArg }),
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+  },
+  wrap(async ({ json: jsonInput, out: outInput }) => {
+    if (!path.isAbsolute(jsonInput)) throw new UserError("JSON path must be absolute");
+    if (!path.isAbsolute(outInput)) throw new UserError("Output .rpt path must be absolute");
+    if (path.extname(outInput).toLowerCase() !== ".rpt") throw new UserError("Output path must have a .rpt extension");
+
+    // Verify the JSON file exists.
+    try { await fs.access(jsonInput); } catch { throw new UserError(`JSON file not found: ${jsonInput}`); }
+
+    // Invoke the writer.
+    await acquire();
+    try {
+      await runWriter(jsonInput, outInput);
+    } finally {
+      release();
+    }
+
+    // Immediately re-read the rebuilt file and return its dump for comparison.
+    const { dump } = await loadReport(outInput);
+    return { builtPath: outInput, ...dump };
   }),
 );
 

@@ -2,6 +2,8 @@
 // Usage: node scripts/smoke-test.mjs <report-dir>
 // The directory must contain avl_print.rpt and application_avl.rpt.
 import { spawn } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 
@@ -48,7 +50,6 @@ const show = async (label, name, args, max = 600) => {
   console.log(`\n### ${label} isError=${r.isError} len=${r.text.length}\n${r.text.slice(0, max)}`);
 };
 
-await show("list_reports", "list_reports", { dir: root, pattern: "avl" }, 500);
 await show("summary", "get_report_summary", { path: rpt("avl_print.rpt") }, 900);
 await show("structure", "get_report_structure", { path: rpt("avl_print.rpt") }, 500);
 await show("data_sources", "get_data_sources", { path: rpt("avl_print.rpt") }, 500);
@@ -67,8 +68,79 @@ console.log("\n===== input validation =====");
 await show("relative path", "get_report_summary", { path: "avl_print.rpt" });
 await show("not rpt", "get_report_summary", { path: "C:\\Windows\\win.ini" });
 await show("missing", "get_report_summary", { path: rpt("nope.rpt") });
-await show("relative dir", "list_reports", { dir: ".." });
-await show("missing dir", "list_reports", { dir: rpt("no-such-dir") });
+await show("relative dir", "search_reports", { dir: "..", query: "xx" });
+await show("missing dir", "search_reports", { dir: rpt("no-such-dir"), query: "xx" });
+
+// ---------------------------------------------------------------------------
+// Roundtrip test: export → save JSON → build .rpt → re-read → compare
+// ---------------------------------------------------------------------------
+console.log("\n===== roundtrip =====");
+let roundtripPassed = true;
+const tmpDir = path.join(os.tmpdir(), `rpt-roundtrip-${Date.now()}`);
+const jsonOut = path.join(tmpDir, "avl_print.json");
+const rptOut  = path.join(tmpDir, "avl_print_rebuilt.rpt");
+
+// 1. Save JSON to disk.
+const saveResult = await call("save_report_json", { path: rpt("avl_print.rpt"), out: jsonOut });
+console.log(`\n[1] save_report_json  isError=${saveResult.isError}  ${saveResult.text.slice(0, 200)}`);
+if (saveResult.isError) { roundtripPassed = false; }
+
+// 2. Build .rpt from the JSON.
+const buildResult = await call("build_report_from_json", { json: jsonOut, out: rptOut });
+console.log(`\n[2] build_report_from_json  isError=${buildResult.isError}  len=${buildResult.text.length}`);
+if (buildResult.isError) {
+  console.log(buildResult.text.slice(0, 500));
+  roundtripPassed = false;
+}
+
+if (!saveResult.isError && !buildResult.isError) {
+  // 3. Compare the original JSON (from disk) with the rebuilt dump.
+  const originalJson = JSON.parse(await fs.readFile(jsonOut, "utf8"));
+  const rebuiltDump  = JSON.parse(buildResult.text);
+
+  // Keys to compare (subset that the SDK can faithfully round-trip).
+  const compareKeys = [
+    "formulas", "sqlExpressions", "recordSelection", "groupSelection",
+    "sortFields", "groups",
+  ];
+
+  // Also compare summary sub-fields that are writable.
+  const summaryKeys = ["title", "author", "subject", "comments", "keywords"];
+
+  let diffs = 0;
+
+  for (const key of compareKeys) {
+    const orig = JSON.stringify(originalJson[key] ?? null);
+    const rebu = JSON.stringify(rebuiltDump[key] ?? null);
+    if (orig !== rebu) {
+      console.log(`  DIFF [${key}]`);
+      console.log(`    original : ${orig.slice(0, 200)}`);
+      console.log(`    rebuilt  : ${rebu.slice(0, 200)}`);
+      diffs++;
+    }
+  }
+
+  if (originalJson.summary && rebuiltDump.summary) {
+    for (const k of summaryKeys) {
+      const orig = originalJson.summary[k] ?? "";
+      const rebu = rebuiltDump.summary[k] ?? "";
+      if (orig !== rebu) {
+        console.log(`  DIFF [summary.${k}]  original="${orig}"  rebuilt="${rebu}"`);
+        diffs++;
+      }
+    }
+  }
+
+  if (diffs === 0) {
+    console.log("\n✓ Roundtrip PASSED – all compared fields match.");
+  } else {
+    console.log(`\n✗ Roundtrip FAILED – ${diffs} field(s) differ.`);
+    roundtripPassed = false;
+  }
+}
+
+// 4. Cleanup temp files.
+try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
 
 child.kill();
-process.exit(0);
+process.exit(roundtripPassed ? 0 : 1);

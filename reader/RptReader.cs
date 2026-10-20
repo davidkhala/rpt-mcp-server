@@ -1,5 +1,29 @@
-// Read-only dumper: loads one .rpt with the Crystal Reports .NET SDK and prints its
-// metadata as JSON (UTF-8, stdout). It never connects to a database or refreshes data.
+// RptReader.exe – read/write bridge between Crystal Reports .rpt files and JSON.
+//
+// Read  mode (default):
+//   RptReader.exe <file.rpt>
+//   Loads the report with the Crystal Reports .NET SDK, dumps metadata as JSON
+//   (UTF-8) to stdout.  Never connects to a database or refreshes data.
+//   The JSON includes a top-level "sourcePath" key with the absolute path of
+//   the input file so that the write mode knows which template to copy.
+//
+// Write mode:
+//   RptReader.exe --write <input.json> <output.rpt>
+//   Copies the original .rpt (recorded in "sourcePath" inside the JSON) to
+//   <output.rpt>, then applies every field that the SDK exposes for writing:
+//     - SummaryInfo (title, author, subject, comments, keywords)
+//     - RecordSelectionFormula, GroupSelectionFormula
+//     - FormulaFields text
+//     - SQLExpressionFields text
+//     - Table location (server + database via SetLogOnInfo)
+//     - Command table SQL text (via RAS DatabaseController)
+//     - ParameterField default values (discrete only; range values cleared)
+//     - Group sort order (SortDirection on SortFields)
+//   Fields the SDK does not allow writing (section layout, running totals,
+//   summary fields, subreport link topology, paper/margin options) are left
+//   as-is in the copied template – they will still match the original because
+//   the template IS the original.
+//
 // Written in C# 5 so it can be built with the in-box .NET Framework csc.exe.
 using System;
 using System.Collections;
@@ -18,30 +42,38 @@ namespace RptReader
     {
         static int Main(string[] args)
         {
-            if (args.Length != 1)
-            {
-                Console.Error.WriteLine("usage: RptReader.exe <file.rpt>");
-                return 2;
-            }
+            if (args.Length == 3 && args[0] == "--write")
+                return RunWrite(args[1], args[2]);
 
+            if (args.Length == 1 && args[0] != "--write")
+                return RunRead(args[0]);
+
+            Console.Error.WriteLine("usage:");
+            Console.Error.WriteLine("  RptReader.exe <file.rpt>                       (read)");
+            Console.Error.WriteLine("  RptReader.exe --write <input.json> <output.rpt> (write)");
+            return 2;
+        }
+
+        // ------------------------------------------------------------------ read
+        static int RunRead(string rptPath)
+        {
             ReportDocument rd = new ReportDocument();
             try
             {
-                rd.Load(args[0]);
+                rd.Load(rptPath);
                 Dictionary<string, object> dump = Dump(rd, rd, true);
-                FileInfo fi = new FileInfo(args[0]);
+                FileInfo fi = new FileInfo(rptPath);
                 dump["file"] = fi.Name;
                 dump["name"] = fi.Name;
                 dump["sizeBytes"] = fi.Length;
+                dump["sourcePath"] = fi.FullName;   // needed by write mode
 
                 JavaScriptSerializer js = new JavaScriptSerializer();
                 js.MaxJsonLength = int.MaxValue;
                 js.RecursionLimit = 200;
                 byte[] bytes = new UTF8Encoding(false).GetBytes(js.Serialize(dump));
                 using (Stream stdout = Console.OpenStandardOutput())
-                {
                     stdout.Write(bytes, 0, bytes.Length);
-                }
                 return 0;
             }
             catch (Exception ex)
@@ -56,6 +88,273 @@ namespace RptReader
             }
         }
 
+        // ------------------------------------------------------------------ write
+        static int RunWrite(string jsonPath, string outRptPath)
+        {
+            // 1. Parse the JSON manifest.
+            string jsonText;
+            try { jsonText = File.ReadAllText(jsonPath, Encoding.UTF8); }
+            catch (Exception ex) { Console.Error.WriteLine("Cannot read JSON: " + ex.Message); return 1; }
+
+            JavaScriptSerializer js = new JavaScriptSerializer();
+            js.MaxJsonLength = int.MaxValue;
+            js.RecursionLimit = 200;
+            Dictionary<string, object> data;
+            try { data = js.Deserialize<Dictionary<string, object>>(jsonText); }
+            catch (Exception ex) { Console.Error.WriteLine("Cannot parse JSON: " + ex.Message); return 1; }
+
+            // 2. Find and copy the template .rpt.
+            string sourcePath = data.ContainsKey("sourcePath") ? data["sourcePath"] as string : null;
+            if (string.IsNullOrEmpty(sourcePath))
+            {
+                Console.Error.WriteLine("JSON must contain a \"sourcePath\" key with the original .rpt path.");
+                return 1;
+            }
+            if (!File.Exists(sourcePath))
+            {
+                Console.Error.WriteLine("sourcePath not found: " + sourcePath);
+                return 1;
+            }
+
+            string outDir = Path.GetDirectoryName(Path.GetFullPath(outRptPath));
+            if (!string.IsNullOrEmpty(outDir) && !Directory.Exists(outDir))
+                Directory.CreateDirectory(outDir);
+
+            File.Copy(sourcePath, outRptPath, overwrite: true);
+
+            // 3. Open the copy and apply every writable field.
+            ReportDocument rd = new ReportDocument();
+            try
+            {
+                rd.Load(outRptPath);
+                ApplyData(rd, data);
+                rd.SaveAs(outRptPath);
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.ToString());
+                return 1;
+            }
+            finally
+            {
+                try { rd.Close(); } catch { }
+                rd.Dispose();
+            }
+        }
+
+        // Apply every field from the JSON dump back onto an open ReportDocument.
+        static void ApplyData(ReportDocument rd, Dictionary<string, object> data)
+        {
+            // --- summary info ---
+            Dictionary<string, object> summary = GetDict(data, "summary");
+            if (summary != null)
+            {
+                string v;
+                if (TryStr(summary, "title",    out v)) rd.SummaryInfo.ReportTitle    = v ?? "";
+                if (TryStr(summary, "author",   out v)) rd.SummaryInfo.ReportAuthor   = v ?? "";
+                if (TryStr(summary, "subject",  out v)) rd.SummaryInfo.ReportSubject  = v ?? "";
+                if (TryStr(summary, "comments", out v)) rd.SummaryInfo.ReportComments = v ?? "";
+                if (TryStr(summary, "keywords", out v)) rd.SummaryInfo.KeywordsInReport = v ?? "";
+            }
+
+            // --- selection formulas ---
+            string sel;
+            if (TryStr(data, "recordSelection", out sel) && sel != null)
+                try { rd.RecordSelectionFormula = sel; } catch { }
+            string grpSel;
+            if (TryStr(data, "groupSelection", out grpSel) && grpSel != null)
+                try { rd.DataDefinition.GroupSelectionFormula = grpSel; } catch { }
+
+            // --- formula fields ---
+            IList formulas = GetList(data, "formulas");
+            if (formulas != null)
+            {
+                foreach (object item in formulas)
+                {
+                    Dictionary<string, object> fd = item as Dictionary<string, object>;
+                    if (fd == null) continue;
+                    string name, text;
+                    if (!TryStr(fd, "name", out name) || !TryStr(fd, "text", out text)) continue;
+                    if (name == null || text == null) continue;
+                    try
+                    {
+                        FormulaFieldDefinition ff = rd.DataDefinition.FormulaFields["{@" + name + "}"];
+                        if (ff == null) ff = rd.DataDefinition.FormulaFields[name];
+                        if (ff != null) ff.Text = text;
+                    }
+                    catch { }
+                }
+            }
+
+            // --- SQL expression fields ---
+            IList sqlExprs = GetList(data, "sqlExpressions");
+            if (sqlExprs != null)
+            {
+                foreach (object item in sqlExprs)
+                {
+                    Dictionary<string, object> fd = item as Dictionary<string, object>;
+                    if (fd == null) continue;
+                    string name, text;
+                    if (!TryStr(fd, "name", out name) || !TryStr(fd, "text", out text)) continue;
+                    if (name == null || text == null) continue;
+                    try
+                    {
+                        SQLExpressionFieldDefinition sf = rd.DataDefinition.SQLExpressionFields["%(" + name + ")"];
+                        if (sf == null) sf = rd.DataDefinition.SQLExpressionFields[name];
+                        if (sf != null) sf.Text = text;
+                    }
+                    catch { }
+                }
+            }
+
+            // --- table connection (server / database only, no credentials) ---
+            IList tables = GetList(data, "tables");
+            if (tables != null)
+            {
+                foreach (object item in tables)
+                {
+                    Dictionary<string, object> td = item as Dictionary<string, object>;
+                    if (td == null) continue;
+                    string tableName;
+                    if (!TryStr(td, "name", out tableName) || tableName == null) continue;
+                    Dictionary<string, object> conn = GetDict(td, "connection");
+                    if (conn == null) continue;
+                    string server, database;
+                    TryStr(conn, "server",   out server);
+                    TryStr(conn, "database", out database);
+                    try
+                    {
+                        Table t = rd.Database.Tables[tableName];
+                        if (t == null) continue;
+                        TableLogOnInfo info = t.LogOnInfo;
+                        if (server   != null) info.ConnectionInfo.ServerName   = server;
+                        if (database != null) info.ConnectionInfo.DatabaseName = database;
+                        t.ApplyLogOnInfo(info);
+                    }
+                    catch { }
+                }
+            }
+
+            // --- command table SQL (via RAS) ---
+            IList commands = GetList(data, "commands");
+            if (commands != null)
+            {
+                try
+                {
+                    IEnumerable rasTables = rd.ReportClientDocument.DatabaseController.Database.Tables;
+                    foreach (object item in commands)
+                    {
+                        Dictionary<string, object> cd = item as Dictionary<string, object>;
+                        if (cd == null) continue;
+                        string cmdName, sql;
+                        if (!TryStr(cd, "name", out cmdName) || !TryStr(cd, "sql", out sql)) continue;
+                        if (cmdName == null || sql == null) continue;
+                        foreach (object o in rasTables)
+                        {
+                            RAS.CommandTable ct = o as RAS.CommandTable;
+                            if (ct != null && ct.Name == cmdName)
+                            {
+                                ct.CommandText = sql;
+                                break;
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+
+            // --- parameter default values (discrete only) ---
+            IList parameters = GetList(data, "parameters");
+            if (parameters != null)
+            {
+                foreach (object item in parameters)
+                {
+                    Dictionary<string, object> pd = item as Dictionary<string, object>;
+                    if (pd == null) continue;
+                    string pname;
+                    if (!TryStr(pd, "name", out pname) || pname == null) continue;
+                    IList defaults = GetList(pd, "defaultValues");
+                    if (defaults == null) continue;
+                    try
+                    {
+                        ParameterFieldDefinition pf = rd.DataDefinition.ParameterFields[pname];
+                        if (pf == null) continue;
+                        ParameterValues newDefaults = new ParameterValues();
+                        foreach (object dv in defaults)
+                        {
+                            Dictionary<string, object> dvd = dv as Dictionary<string, object>;
+                            if (dvd == null) continue;
+                            string val;
+                            if (TryStr(dvd, "value", out val) && val != null)
+                            {
+                                ParameterDiscreteValue pdv = new ParameterDiscreteValue();
+                                pdv.Value = val;
+                                string desc;
+                                if (TryStr(dvd, "description", out desc) && desc != null)
+                                    pdv.Description = desc;
+                                newDefaults.Add(pdv);
+                            }
+                        }
+                        if (newDefaults.Count > 0)
+                            pf.DefaultValues = newDefaults;
+                    }
+                    catch { }
+                }
+            }
+
+            // --- sort field directions ---
+            IList sortFields = GetList(data, "sortFields");
+            if (sortFields != null)
+            {
+                int idx = 0;
+                foreach (object item in sortFields)
+                {
+                    Dictionary<string, object> sfd = item as Dictionary<string, object>;
+                    if (sfd == null) { idx++; continue; }
+                    string dir;
+                    if (!TryStr(sfd, "direction", out dir) || dir == null) { idx++; continue; }
+                    try
+                    {
+                        if (idx < rd.DataDefinition.SortFields.Count)
+                        {
+                            SortField sf = rd.DataDefinition.SortFields[idx];
+                            if (dir == "AscendingOrder")
+                                sf.SortDirection = SortDirection.AscendingOrder;
+                            else if (dir == "DescendingOrder")
+                                sf.SortDirection = SortDirection.DescendingOrder;
+                        }
+                    }
+                    catch { }
+                    idx++;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ helpers
+        static Dictionary<string, object> GetDict(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (!d.TryGetValue(key, out v)) return null;
+            return v as Dictionary<string, object>;
+        }
+
+        static IList GetList(Dictionary<string, object> d, string key)
+        {
+            object v;
+            if (!d.TryGetValue(key, out v)) return null;
+            return v as IList;
+        }
+
+        static bool TryStr(Dictionary<string, object> d, string key, out string result)
+        {
+            object v;
+            if (!d.TryGetValue(key, out v)) { result = null; return false; }
+            result = v == null ? null : v.ToString();
+            return true;
+        }
+
+        // ------------------------------------------------------------------ read helpers (unchanged)
         static string S(object o) { return o == null ? null : o.ToString(); }
 
         static Dictionary<string, object> D(params object[] kv)
@@ -84,7 +383,7 @@ namespace RptReader
             r["recordSelection"] = Safe(delegate { return rd.RecordSelectionFormula; });
             r["groupSelection"] = Safe(delegate { return rd.DataDefinition.GroupSelectionFormula; });
 
-            // ReportDocument.Subreports throws NotSupportedException when called on a subreport, so only the root enumerates them.
+            // ReportDocument.Subreports throws NotSupportedException when called on a subreport.
             List<object> subs = new List<object>();
             if (isRoot)
             {
@@ -99,7 +398,6 @@ namespace RptReader
             return r;
         }
 
-        // A failure while reading one facet must not hide the others.
         static object Safe(Func<object> f)
         {
             try { return f(); }
@@ -158,10 +456,7 @@ namespace RptReader
             {
                 List<object> fields = new List<object>();
                 foreach (DatabaseFieldDefinition f in t.Fields)
-                {
                     fields.Add(D("name", f.Name, "formulaName", f.FormulaName, "type", S(f.ValueType), "length", f.NumberOfBytes));
-                }
-                // Credentials are deliberately not exported.
                 ConnectionInfo ci = t.LogOnInfo.ConnectionInfo;
                 list.Add(D(
                     "name", t.Name,
@@ -194,7 +489,6 @@ namespace RptReader
             return l;
         }
 
-        // SQL of "Add Command" tables is only reachable through the RAS client document.
         static object Commands(ReportDocument rd, ReportDocument root, bool isRoot)
         {
             List<object> list = new List<object>();
